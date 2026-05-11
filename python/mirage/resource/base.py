@@ -36,6 +36,15 @@ class BaseResource:
 
     _index_ttl: float = 600
 
+    # Whether this resource carries enough version information for
+    # snapshot+replay drift detection. When True, the resource's stat()
+    # must populate FileStat.fingerprint with a stable per-path marker
+    # (ETag, revisionId, commit SHA, etc.) that distinguishes content
+    # versions. When False (the default), reads are treated as live-only
+    # at replay time: no fingerprint is recorded at snapshot, no drift
+    # check fires at load. See docs/snapshot.mdx for the contract.
+    SUPPORTS_SNAPSHOT: bool = False
+
     def __init__(
         self,
         index: IndexConfig | None = None,

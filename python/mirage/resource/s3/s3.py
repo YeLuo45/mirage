@@ -84,6 +84,7 @@ class S3Resource(BaseResource):
     is_remote: bool = True
     _ops: dict[str, Any] = _S3_OPS
     PROMPT: str = PROMPT
+    SUPPORTS_SNAPSHOT: bool = True
 
     def __init__(self, config: S3Config) -> None:
         super().__init__()

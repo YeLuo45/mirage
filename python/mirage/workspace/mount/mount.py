@@ -20,7 +20,7 @@ from mirage.commands.config import RegisteredCommand
 from mirage.commands.resolve import get_extension
 from mirage.commands.spec import CommandSpec
 from mirage.io.types import ByteSource, IOResult
-from mirage.observe.context import set_virtual_prefix
+from mirage.observe.context import push_mount_prefix
 from mirage.ops.registry import RegisteredOp
 from mirage.resource.base import BaseResource
 from mirage.types import ConsistencyPolicy, MountMode, PathSpec
@@ -365,7 +365,7 @@ class Mount:
         if session_id is not None:
             kw["session_id"] = session_id
 
-        set_virtual_prefix(mount_prefix)
+        prev_prefix = push_mount_prefix(mount_prefix)
         try:
             for cmd in handlers:
                 if cmd.write and self.mode == MountMode.READ:
@@ -379,7 +379,7 @@ class Mount:
                     return result
             return None, IOResult()
         finally:
-            set_virtual_prefix("")
+            push_mount_prefix(prev_prefix)
 
     async def execute_op(
         self,
@@ -414,10 +414,14 @@ class Mount:
             prefix=mount_prefix,
         )
         kwargs.setdefault("index", self.resource.index)
-        for op in levels:
-            result = op.fn(self.resource.accessor, scope, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            if result is not None:
-                return result
-        return None
+        prev_prefix = push_mount_prefix(mount_prefix)
+        try:
+            for op in levels:
+                result = op.fn(self.resource.accessor, scope, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not None:
+                    return result
+            return None
+        finally:
+            push_mount_prefix(prev_prefix)

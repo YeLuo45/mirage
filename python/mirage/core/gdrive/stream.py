@@ -21,6 +21,7 @@ from mirage.core.google.drive import download_file_stream
 from mirage.core.gsheets.read import read_spreadsheet
 from mirage.core.gslides.read import read_presentation
 from mirage.observe.context import record_stream
+from mirage.observe.record import OpRecord
 from mirage.types import PathSpec
 
 
@@ -52,16 +53,16 @@ async def read_stream(
         return await read_spreadsheet(accessor.token_manager, result.entry.id)
     if rt == "gdrive/gslide":
         return await read_presentation(accessor.token_manager, result.entry.id)
-    return _stream_file(accessor, result.entry.id, path, chunk_size)
+    rec = record_stream("read", path, "gdrive")
+    return _stream_file(accessor, result.entry.id, chunk_size, rec)
 
 
 async def _stream_file(
     accessor: GDriveAccessor,
     file_id: str,
-    path: PathSpec,
     chunk_size: int,
+    rec: OpRecord | None,
 ) -> AsyncIterator[bytes]:
-    rec = record_stream("read", path, "gdrive")
     async for chunk in download_file_stream(accessor.token_manager, file_id,
                                             chunk_size):
         if rec is not None:

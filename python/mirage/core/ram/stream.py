@@ -24,8 +24,7 @@ def _norm(path: str) -> str:
     return "/" + path.strip("/")
 
 
-async def stream(accessor: RAMAccessor,
-                 path: PathSpec) -> AsyncIterator[bytes]:
+def stream(accessor: RAMAccessor, path: PathSpec) -> AsyncIterator[bytes]:
     if isinstance(path, str):
         path = PathSpec(original=path, directory=path)
     if isinstance(path, PathSpec):
@@ -41,18 +40,14 @@ async def stream(accessor: RAMAccessor,
     rec = record_stream("read", path, "ram")
     if rec is not None:
         rec.bytes = len(data)
+    return _stream_body(data)
+
+
+async def _stream_body(data: bytes) -> AsyncIterator[bytes]:
     yield data
 
 
-async def read_stream(accessor: RAMAccessor,
-                      path: PathSpec,
-                      index: IndexCacheStore = None) -> AsyncIterator[bytes]:
-    if isinstance(path, str):
-        path = PathSpec(original=path, directory=path)
-    if isinstance(path, PathSpec):
-        prefix = path.prefix
-        path = path.original
-    if prefix and path.startswith(prefix):
-        path = path[len(prefix):] or "/"
-    async for chunk in stream(accessor, path):
-        yield chunk
+def read_stream(accessor: RAMAccessor,
+                path: PathSpec,
+                index: IndexCacheStore = None) -> AsyncIterator[bytes]:
+    return stream(accessor, path)

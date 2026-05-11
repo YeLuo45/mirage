@@ -14,12 +14,32 @@
 
 import time
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 
 from mirage.observe.record import OpRecord
 
-_recorder: ContextVar[list[OpRecord] | None] = ContextVar("_recorder",
-                                                          default=None)
-_virtual_prefix: ContextVar[str] = ContextVar("_virtual_prefix", default="")
+
+@dataclass
+class Recorder:
+    """Active recording state for a session.
+
+    Bundles the sink that collects records with the current mount
+    prefix used to virtualize paths emitted from resource backends.
+    Mount sets the prefix on entry and restores it on exit, so
+    record() always sees the right prefix without resource backends
+    knowing anything about mounts.
+
+    Args:
+        sink (list[OpRecord]): Where new records are appended.
+        mount_prefix (str): Current dispatch frame's mount prefix
+            (e.g. "/s3"). Empty when no mount is active.
+    """
+
+    sink: list[OpRecord] = field(default_factory=list)
+    mount_prefix: str = ""
+
+
+_recorder: ContextVar[Recorder | None] = ContextVar("_recorder", default=None)
 
 
 def start_recording() -> list[OpRecord]:
@@ -28,9 +48,9 @@ def start_recording() -> list[OpRecord]:
     Returns:
         list[OpRecord]: The list that will collect records.
     """
-    records: list[OpRecord] = []
-    _recorder.set(records)
-    return records
+    rec = Recorder()
+    _recorder.set(rec)
+    return rec.sink
 
 
 def stop_recording() -> None:
@@ -38,19 +58,34 @@ def stop_recording() -> None:
     _recorder.set(None)
 
 
-def set_virtual_prefix(prefix: str) -> None:
-    """Set the mount prefix for the current async context.
+def active_recorder() -> Recorder | None:
+    """Return the active Recorder for the current async context, if any."""
+    return _recorder.get()
+
+
+def push_mount_prefix(prefix: str) -> str:
+    """Set the mount prefix on the active Recorder. Returns the previous
+    prefix so callers can restore it.
+
+    No-op (and returns "") when no recorder is active.
 
     Args:
         prefix (str): Mount prefix (e.g. "/s3"). Empty string to clear.
+
+    Returns:
+        str: The prefix that was active before this call.
     """
-    _virtual_prefix.set(prefix)
+    rec = _recorder.get()
+    if rec is None:
+        return ""
+    prev = rec.mount_prefix
+    rec.mount_prefix = prefix
+    return prev
 
 
-def _apply_prefix(path: str) -> str:
-    prefix = _virtual_prefix.get("")
+def _virtual(path: str, prefix: str) -> str:
     if prefix and not path.startswith(prefix):
-        return prefix.rstrip("/") + path
+        return prefix + path
     return path
 
 
@@ -65,18 +100,20 @@ def record(op: str, path: str, source: str, nbytes: int,
         nbytes (int): Bytes transferred.
         start_ms (int): Monotonic start time in milliseconds.
     """
-    recorder = _recorder.get()
-    if recorder is None:
+    rec = _recorder.get()
+    if rec is None:
         return
     elapsed = int(time.monotonic() * 1000) - start_ms
-    recorder.append(
+    prefix = rec.mount_prefix
+    rec.sink.append(
         OpRecord(
             op=op,
-            path=_apply_prefix(path),
+            path=_virtual(path, prefix),
             source=source,
             bytes=nbytes,
             timestamp=int(time.time() * 1000),
             duration_ms=elapsed,
+            mount_prefix=prefix,
         ))
 
 
@@ -97,16 +134,18 @@ def record_stream(op: str, path: str, source: str) -> OpRecord | None:
     Returns:
         OpRecord | None: Mutable record, or None if not recording.
     """
-    recorder = _recorder.get()
-    if recorder is None:
+    rec = _recorder.get()
+    if rec is None:
         return None
-    rec = OpRecord(
+    prefix = rec.mount_prefix
+    op_rec = OpRecord(
         op=op,
-        path=_apply_prefix(path),
+        path=_virtual(path, prefix),
         source=source,
         bytes=0,
         timestamp=int(time.time() * 1000),
         duration_ms=0,
+        mount_prefix=prefix,
     )
-    recorder.append(rec)
-    return rec
+    rec.sink.append(op_rec)
+    return op_rec

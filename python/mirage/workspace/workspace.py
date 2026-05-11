@@ -42,7 +42,8 @@ from mirage.shell.barrier import BarrierPolicy, apply_barrier
 from mirage.shell.job_table import JobTable
 from mirage.shell.parse import find_syntax_error, parse
 from mirage.types import (DEFAULT_AGENT_ID, DEFAULT_SESSION_ID,
-                          ConsistencyPolicy, FileStat, MountMode, PathSpec)
+                          ConsistencyPolicy, DriftPolicy, FileStat,
+                          FingerprintKey, MountMode, PathSpec, StateKey)
 from mirage.workspace.abort import MirageAbortError
 from mirage.workspace.fuse import FuseManager
 from mirage.workspace.history import ExecutionHistory
@@ -54,7 +55,8 @@ from mirage.workspace.session import (Session, SessionManager,
                                       assert_mount_allowed,
                                       reset_current_session,
                                       set_current_session)
-from mirage.workspace.snapshot import (apply_state_dict, build_mount_args,
+from mirage.workspace.snapshot import (ContentDriftError, apply_state_dict,
+                                       build_mount_args, check_drift,
                                        norm_mount_prefix, read_tar)
 from mirage.workspace.snapshot import snapshot as _write_snapshot
 from mirage.workspace.snapshot import to_state_dict
@@ -69,6 +71,36 @@ _DISPATCH_WRITE_OPS = frozenset(
 _HELP_HINT = (
     "Tip: run `man` to list every available command grouped by resource, "
     "`man <cmd>` for a single entry, and `<cmd> --help` for flag details.")
+
+
+def _drop_fingerprinted_from_cache(ws: "Workspace") -> None:
+    cache = ws._cache
+    if not hasattr(cache, "_entries") or not hasattr(cache, "_store"):
+        return
+    for path in ws._fingerprints:
+        cache._entries.pop(path, None)
+        cache._store.files.pop(path, None)
+
+
+def _inject_version_pins(ws: "Workspace", entries: list[dict]) -> None:
+    from mirage.types import VersionId
+    for f in entries:
+        vid = f.get(FingerprintKey.VERSION_ID)
+        if not vid:
+            continue
+        path = f[FingerprintKey.PATH]
+        try:
+            mount = ws._registry.mount_for(path)
+        except ValueError:
+            continue
+        accessor = getattr(mount.resource, "accessor", None)
+        if accessor is None:
+            continue
+        pins = getattr(accessor, "version_pins", None)
+        if pins is None:
+            continue
+        pins[path] = VersionId(vid)
+        ws._pinned_paths.add(path)
 
 
 class Workspace:
@@ -114,6 +146,10 @@ class Workspace:
         self._registry.set_default_mount(self._cache)
         self._locked_paths: set[str] = set()
         self._closed = False
+        self._fingerprints: dict[str, str] = {}
+        self._drift_policy: DriftPolicy = DriftPolicy.OFF
+        self._drift_check_pending: bool = False
+        self._pinned_paths: set[str] = set()
         self.job_table = JobTable()
         self._current_agent_id: str = agent_id
         self._default_session_id = session_id
@@ -290,28 +326,81 @@ class Workspace:
 
     # ── snapshot / load / copy ─────────────────────────────────────────────
 
-    def snapshot(self, target, *, compress: str | None = None) -> None:
+    async def snapshot(self, target, *, compress: str | None = None) -> None:
         """Serialize this workspace to a tar.
+
+        Captured:
+            * Mount configs, sessions, history, finished jobs.
+            * Cache bytes for fast replay.
+            * One fingerprint entry per remote read (ETag, plus VersionId
+              when the backend supports versioning).
+
+        NOT captured:
+            * Live state of mounts with SUPPORTS_SNAPSHOT=False (Gmail,
+              Slack, Linear, etc.). Load logs a warning naming them.
+            * Files the agent never touched.
+            * Bytes of remote objects. Recovery of original bytes works
+              only when the backend supports versioning (S3, R2) and the
+              recorded VersionId still exists on the source.
+
+        Async because fingerprint capture stats each touched path on a
+        SUPPORTS_SNAPSHOT mount.
 
         Args:
             target: filesystem path OR a writable file-like object.
             compress: None | "gz" | "bz2" | "xz".
         """
-        _write_snapshot(self, target, compress=compress)
+        await _write_snapshot(self, target, compress=compress)
 
     @classmethod
-    def load(cls, source, *, resources: dict | None = None) -> "Workspace":
+    def load(cls,
+             source,
+             *,
+             resources: dict | None = None,
+             drift_policy: DriftPolicy = DriftPolicy.STRICT) -> "Workspace":
         """Reconstruct a Workspace from a tar.
+
+        Per recorded read:
+            1. VersionId recorded + backend versioning active: reads pin
+               to that VersionId. Drift check skipped (original bytes
+               served even if the live object moved on).
+            2. No VersionId: live fingerprint compared against recorded.
+               STRICT raises ContentDriftError on mismatch. OFF evicts
+               the snapshot cache for the path so reads serve current.
+
+        Drift check is eager (fires once on the first dispatch or
+        execute), so downstream code can rely on consistent state.
 
         Args:
             source: filesystem path OR a readable file-like object.
-            resources: {prefix: Resource} overrides for mounts that
-                were saved with redacted creds.
+            resources: {prefix: Resource} overrides for mounts saved
+                with redacted creds.
+            drift_policy: STRICT (default) raises on mismatch. OFF
+                disables drift checking and evicts snapshot cache for
+                fingerprinted paths.
         """
         state = read_tar(source)
-        return cls._from_state(state, resources=resources)
+        ws = cls._from_state(state, resources=resources)
+        fingerprint_entries = state.get(StateKey.FINGERPRINTS) or []
+        ws._fingerprints = {
+            f[FingerprintKey.PATH]: f[FingerprintKey.FINGERPRINT]
+            for f in fingerprint_entries
+        }
+        ws._drift_policy = drift_policy
+        ws._drift_check_pending = (drift_policy != DriftPolicy.OFF
+                                   and bool(ws._fingerprints))
+        _inject_version_pins(ws, fingerprint_entries)
+        if drift_policy == DriftPolicy.OFF and ws._fingerprints:
+            _drop_fingerprinted_from_cache(ws)
+        live_only = state.get(StateKey.LIVE_ONLY_MOUNTS) or []
+        if live_only:
+            logger.warning(
+                "Workspace.load: %s mount(s) opt out of snapshot replay; "
+                "reads against them will serve current state with no drift "
+                "detection: %s", len(live_only), live_only)
+        return ws
 
-    def copy(self) -> "Workspace":
+    async def copy(self) -> "Workspace":
         # Reuse this process's resources so remote backends (S3, Redis,
         # GDrive) stay shared between original and copy. Local backends
         # (RAM, Disk) restore their content fresh into the new resources
@@ -320,7 +409,7 @@ class Workspace:
         # (S3, Redis, GDrive...). Local content resources (RAM, Disk)
         # are reconstructed fresh so the copy's writes don't clobber
         # the original's in-process data.
-        state = to_state_dict(self)
+        state = await to_state_dict(self)
         auto_prefixes = {"/dev/"}
         if self.observer is not None:
             auto_prefixes.add(norm_mount_prefix(self.observer.prefix))
@@ -350,11 +439,13 @@ class Workspace:
         return ws
 
     def __deepcopy__(self, memo) -> "Workspace":
-        return self.copy()
+        raise NotImplementedError(
+            "Workspace.copy is async (it captures fingerprints for replay). "
+            "Call `await ws.copy()` directly instead of `copy.deepcopy(ws)`.")
 
     def __copy__(self) -> "Workspace":
         raise NotImplementedError("Workspace has no useful shallow copy — "
-                                  "use ws.copy() or copy.deepcopy(ws).")
+                                  "use `await ws.copy()`.")
 
     # ── session lifecycle ──────────────────────────────────────────────────
 
@@ -402,6 +493,8 @@ class Workspace:
 
     async def dispatch(self, op: str, path: PathSpec,
                        **kwargs: Any) -> tuple[Any, IOResult]:
+        if self._drift_check_pending:
+            await self._run_pending_drift_check()
         mount = self._registry.mount_for(path.original)
         assert_mount_allowed(mount.prefix)
         cacheable = mount.resource.is_remote is True
@@ -430,6 +523,25 @@ class Workspace:
         if op in _DISPATCH_WRITE_OPS:
             await self._invalidate_after_write(mount, path.original)
         return result, IOResult()
+
+    async def _run_pending_drift_check(self) -> None:
+        """Drain the post-load drift check.
+
+        Called once on the first async entry point (dispatch or execute)
+        after Workspace.load with a non-OFF drift policy. Walks every
+        recorded fingerprint and head-checks it against the live source;
+        raises ContentDriftError on the first mismatch. Subsequent calls
+        are no-ops.
+
+        Paths that carry a VersionId pin are skipped: reads against them
+        will fetch the exact recorded version, so a live fingerprint
+        mismatch is expected and harmless.
+        """
+        self._drift_check_pending = False
+        for path, recorded in self._fingerprints.items():
+            if path in self._pinned_paths:
+                continue
+            await check_drift(self, path, recorded)
 
     async def stat(self, path: str) -> FileStat:
         scope = PathSpec(original=path, directory=path, resolved=True)
@@ -565,6 +677,8 @@ class Workspace:
         """
         if cancel is not None and cancel.is_set():
             raise MirageAbortError()
+        if self._drift_check_pending:
+            await self._run_pending_drift_check()
         use_native = native if native is not None else self._native
         if use_native:
             if not self._fuse.mountpoint:
@@ -632,7 +746,7 @@ class Workspace:
             io.stdout = stdout
             await self.apply_io(io)
             return io
-        except MirageAbortError:
+        except (MirageAbortError, ContentDriftError):
             raise
         except Exception as exc:
             io = IOResult(exit_code=1, stderr=str(exc).encode())
