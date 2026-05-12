@@ -56,7 +56,9 @@ def test_strict_load_raises_when_s3_etag_drifts(tmp_path):
         with pytest.raises(ContentDriftError) as exc_info:
             asyncio.run(dst.execute("cat /s3/data.csv"))
         assert exc_info.value.path == "/s3/data.csv"
-        assert exc_info.value.live_fingerprint != exc_info.value.snapshot_fingerprint
+        live = exc_info.value.live_fingerprint
+        recorded = exc_info.value.snapshot_fingerprint
+        assert live != recorded
 
 
 def test_off_load_serves_drifted_bytes_silently(tmp_path):
@@ -132,8 +134,8 @@ def test_version_pin_serves_original_bytes_on_versioned_bucket(tmp_path):
     """
     store = {"data.csv": b"original\n"}
     with ExitStack() as stack:
-        stack.enter_context(patch_s3_multi({"test-bucket": store},
-                                           versioned={"test-bucket"}))
+        stack.enter_context(
+            patch_s3_multi({"test-bucket": store}, versioned={"test-bucket"}))
         src = Workspace({"/s3": (S3Resource(_config()), MountMode.WRITE)},
                         mode=MountMode.WRITE)
         asyncio.run(src.execute("cat /s3/data.csv"))
@@ -172,7 +174,9 @@ def test_live_only_mount_does_not_block_snapshot(tmp_path, caplog):
 
     with caplog.at_level("WARNING"):
         Workspace.load(snap)
-    assert any("live-only" in r.message.lower() or "live-only" in r.getMessage().lower()
+    assert any("live-only" in r.message.lower()
+               or "live-only" in r.getMessage().lower()
                for r in caplog.records) or any(
-                   "no drift" in r.message.lower() or "no drift" in r.getMessage().lower()
+                   "no drift" in r.message.lower()
+                   or "no drift" in r.getMessage().lower()
                    for r in caplog.records)
