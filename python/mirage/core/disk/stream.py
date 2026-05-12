@@ -20,7 +20,6 @@ import aiofiles
 from mirage.accessor.disk import DiskAccessor
 from mirage.cache.index import IndexCacheStore
 from mirage.observe.context import record_stream
-from mirage.observe.record import OpRecord
 from mirage.types import PathSpec
 
 
@@ -31,10 +30,10 @@ def _resolve(root: Path, path: str) -> Path:
     return resolved
 
 
-def read_stream(accessor: DiskAccessor,
-                path: PathSpec,
-                index: IndexCacheStore = None,
-                chunk_size: int = 8192) -> AsyncIterator[bytes]:
+async def read_stream(accessor: DiskAccessor,
+                      path: PathSpec,
+                      index: IndexCacheStore = None,
+                      chunk_size: int = 8192) -> AsyncIterator[bytes]:
     if isinstance(path, str):
         path = PathSpec(original=path, directory=path)
     if isinstance(path, PathSpec):
@@ -42,14 +41,9 @@ def read_stream(accessor: DiskAccessor,
         path = path.original
     if prefix and path.startswith(prefix):
         path = path[len(prefix):] or "/"
+    root = accessor.root
     rec = record_stream("read", path, "disk")
-    return _read_stream_body(accessor, path, rec, chunk_size)
-
-
-async def _read_stream_body(accessor: DiskAccessor, path: str,
-                            rec: OpRecord | None,
-                            chunk_size: int) -> AsyncIterator[bytes]:
-    p = _resolve(accessor.root, path)
+    p = _resolve(root, path)
     async with aiofiles.open(p, "rb") as f:
         while True:
             chunk = await f.read(chunk_size)

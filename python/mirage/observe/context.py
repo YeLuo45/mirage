@@ -13,26 +13,28 @@
 # ========= Copyright 2026 @ Strukto.AI All Rights Reserved. =========
 
 import time
+from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from mirage.observe.record import OpRecord
 
 
-@dataclass
+@dataclass(frozen=True)
 class Recorder:
     """Active recording state for a session.
 
-    Bundles the sink that collects records with the current mount
-    prefix used to virtualize paths emitted from resource backends.
-    Mount sets the prefix on entry and restores it on exit, so
-    record() always sees the right prefix without resource backends
-    knowing anything about mounts.
+    Bundles the sink (shared by reference across all push frames) with
+    the mount_prefix for the current async frame. Frozen so each push
+    is task-isolated: ``push_mount_prefix`` creates a new Recorder for
+    the calling task via ``_recorder.set``, never mutates the parent.
+    The sink list is the one piece that's intentionally shared, so
+    records emitted from any frame land in the same collection.
 
     Args:
         sink (list[OpRecord]): Where new records are appended.
-        mount_prefix (str): Current dispatch frame's mount prefix
-            (e.g. "/s3"). Empty when no mount is active.
+        mount_prefix (str): Current frame's mount prefix (e.g. "/s3").
+            Empty when no mount is active.
     """
 
     sink: list[OpRecord] = field(default_factory=list)
@@ -67,6 +69,12 @@ def push_mount_prefix(prefix: str) -> str:
     """Set the mount prefix on the active Recorder. Returns the previous
     prefix so callers can restore it.
 
+    Task-isolated: replaces the Recorder for the current task via
+    ``_recorder.set`` (the new Recorder shares the same sink list, so
+    records still aggregate together). Other tasks reading the
+    Recorder via their own contextvar copy continue to see their
+    previous prefix.
+
     No-op (and returns "") when no recorder is active.
 
     Args:
@@ -78,9 +86,34 @@ def push_mount_prefix(prefix: str) -> str:
     rec = _recorder.get()
     if rec is None:
         return ""
-    prev = rec.mount_prefix
-    rec.mount_prefix = prefix
-    return prev
+    _recorder.set(Recorder(sink=rec.sink, mount_prefix=prefix))
+    return rec.mount_prefix
+
+
+async def with_mount_prefix(prefix: str,
+                            it: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Wrap an async iterator so the recorder's mount prefix is `prefix`
+    during each ``__anext__`` of the underlying stream.
+
+    Mirrors the side-effect-on-iteration pattern used by
+    ``exit_on_empty``. Lets dispatchers preserve resource backends as
+    ``async def with yield`` while still capturing the correct mount
+    prefix in records emitted lazily during stream consumption.
+
+    Args:
+        prefix (str): Mount prefix to push during iteration.
+        it (AsyncIterator[bytes]): The stream to wrap.
+    """
+    aiter = it.__aiter__()
+    while True:
+        prev = push_mount_prefix(prefix)
+        try:
+            chunk = await aiter.__anext__()
+        except StopAsyncIteration:
+            push_mount_prefix(prev)
+            return
+        push_mount_prefix(prev)
+        yield chunk
 
 
 def _virtual(path: str, prefix: str) -> str:

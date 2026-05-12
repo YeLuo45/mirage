@@ -19,21 +19,16 @@ from mirage.accessor.s3 import S3Accessor
 from mirage.cache.index import IndexCacheStore
 from mirage.core.s3._client import _client_kwargs, _key, async_session
 from mirage.observe.context import record, record_stream
-from mirage.observe.record import OpRecord
 from mirage.types import PathSpec
 
 
-def read_stream(
+async def read_stream(
     accessor: S3Accessor,
     path: PathSpec,
     index: IndexCacheStore = None,
     chunk_size: int = 8192,
 ) -> AsyncIterator[bytes]:
-    """Async iterator yielding chunks of an S3 object.
-
-    Sync function so the eager `record_stream` call happens in the
-    caller's mount frame — the inner async generator only runs at
-    consumption time, which may be after the dispatch frame exits.
+    """Async generator yielding chunks of an S3 object.
 
     Args:
         accessor (S3Accessor): S3 accessor.
@@ -50,14 +45,8 @@ def read_stream(
     if prefix and path.startswith(prefix):
         path = path[len(prefix):] or "/"
     pin = accessor.version_pins.get(virtual)
-    rec = record_stream("read", path, "s3")
-    return _read_stream_body(accessor, path, rec, chunk_size, pin)
-
-
-async def _read_stream_body(accessor: S3Accessor, path: str,
-                            rec: OpRecord | None, chunk_size: int,
-                            pin: str | None) -> AsyncIterator[bytes]:
     config = accessor.config
+    rec = record_stream("read", path, "s3")
     session = async_session(config)
     async with session.client(**_client_kwargs(config)) as client:
         kwargs: dict = {"Bucket": config.bucket, "Key": _key(path)}
